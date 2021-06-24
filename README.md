@@ -12,7 +12,8 @@
 - [Examples](#examples)
 - Install gophernotes:
   - [Prerequisites](#prerequisites)
-  - [Linux](#linux)
+  - [FreeBSD](#linux-or-freebsd)
+  - [Linux](#linux-or-freebsd)
   - [Mac](#mac)
   - [Windows](#windows)
   - [Docker](#docker)
@@ -40,23 +41,25 @@
 
 ### Prerequisites
 
-- [Go 1.11+](https://golang.org/doc/install) - including GOPATH/bin added to your PATH (i.e., you can run Go binaries that you `go install`).
+- [Go 1.13+](https://golang.org/doc/install) - including GOPATH/bin added to your PATH (i.e., you can run Go binaries that you `go install`).
 - [Jupyter Notebook](http://jupyter.readthedocs.io/en/latest/install.html) or [nteract](https://nteract.io/desktop)
 - [git](https://git-scm.com/download) - usually already present on Linux and Mac OS X. If not present, follow the instructions at [https://git-scm.com/download](https://git-scm.com/download)
 
-### Linux
+### Linux or FreeBSD
 
-Quick installation as module, requires Go 1.12+
+The instructions below should work both on Linux and on FreeBSD.
+
+Method 1: quick installation as module
 ```sh
 $ env GO111MODULE=on go get github.com/gopherdata/gophernotes
 $ mkdir -p ~/.local/share/jupyter/kernels/gophernotes
 $ cd ~/.local/share/jupyter/kernels/gophernotes
-$ cp "$(go env GOPATH)"/pkg/mod/github.com/gopherdata/gophernotes@v0.7.0/kernel/*  "."
+$ cp "$(go env GOPATH)"/pkg/mod/github.com/gopherdata/gophernotes@v0.7.3/kernel/*  "."
 $ chmod +w ./kernel.json # in case copied kernel.json has no write permission
 $ sed "s|gophernotes|$(go env GOPATH)/bin/gophernotes|" < kernel.json.in > kernel.json
 ```
 
-Manual installation from GOPATH, also works with Go 1.11
+Method 2: manual installation from GOPATH
 ```sh
 $ env GO111MODULE=off go get -d -u github.com/gopherdata/gophernotes
 $ cd "$(go env GOPATH)"/src/github.com/gopherdata/gophernotes
@@ -87,17 +90,17 @@ $ jupyter --data-dir
 
 **Important Note** - gomacro relies on the `plugin` package when importing third party libraries. This package works reliably on Mac OS X with Go 1.10.2+ as long as you **never** execute the command `strip gophernotes`.
 
-Quick installation as module, requires Go 1.12+
+Method 1: quick installation as module
 ```sh
 $ env GO111MODULE=on go get github.com/gopherdata/gophernotes
 $ mkdir -p ~/Library/Jupyter/kernels/gophernotes
 $ cd ~/Library/Jupyter/kernels/gophernotes
-$ cp "$(go env GOPATH)"/pkg/mod/github.com/gopherdata/gophernotes@v0.7.0/kernel/*  "."
+$ cp "$(go env GOPATH)"/pkg/mod/github.com/gopherdata/gophernotes@v0.7.3/kernel/*  "."
 $ chmod +w ./kernel.json # in case copied kernel.json has no write permission
 $ sed "s|gophernotes|$(go env GOPATH)/bin/gophernotes|" < kernel.json.in > kernel.json
 ```
 
-Manual installation from GOPATH, also works with Go 1.11
+Method 2: manual installation from GOPATH
 ```sh
 $ env GO111MODULE=off go get -d -u github.com/gopherdata/gophernotes
 $ cd "$(go env GOPATH)"/src/github.com/gopherdata/gophernotes
@@ -197,15 +200,27 @@ $ docker run -it -p 8888:8888 -v /path/to/local/notebooks:/path/to/notebooks/in/
 
 - Have fun!
 
+## Special commands
+
+In addition to Go code, the following special commands are also supported - they must be on a line by their own:
+- %cd [path]
+- %go111module {on|off}
+- %help
+- $ shell_command [args...]
+
 ## Limitations
 
 gophernotes uses [gomacro](https://github.com/cosmos72/gomacro) under the hood to evaluate Go code interactively. You can evaluate most any Go code with gomacro, but there are some limitations, which are discussed in further detail [here](https://github.com/cosmos72/gomacro#current-status).  Most notably, gophernotes does NOT support:
 
-- third party packages when running natively on Windows - This is a current limitation of the Go `plugin` package.
+- importing third party packages when running natively on Windows - This is a current limitation of the Go `plugin` package.
 - some corner cases on interpreted interfaces, as interface -&gt; interface type switch and type assertion, are not implemented yet.
+- some corner cases on recursive types may not work correctly.
 - conversion from typed constant to interpreted interface is not implemented. Workaround: assign the constant to a variable, then convert the variable to the interpreted interface type.
+- conversions from/to unsafe.Pointer are not supported.
 - goto is only partially implemented.
 - out-of-order code in the same cell is supported, but not heavily tested. It has some known limitations for composite literals.
+
+Also, creation of new named types is emulated, and their methods are visible only to interpreted code.
 
 ## Troubleshooting
 
@@ -239,7 +254,7 @@ Restart jupyter, and you should now be up and running.
 
 ### error "could not import C (no metadata for C)" when importing a package
 
-At a first analysis, it seems to be a limitation of the new import mechanism that supports Go 1.11 modules.
+At a first analysis, it seems to be a limitation of the new import mechanism that supports Go modules.
 You can switch the old (non module-aware) mechanism with the command `%go111module off`
 
 To re-enable modules support, execute `%go111module on`

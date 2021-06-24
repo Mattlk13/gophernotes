@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"reflect"
+	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/cosmos72/gomacro/base"
 	basereflect "github.com/cosmos72/gomacro/base/reflect"
 	interp "github.com/cosmos72/gomacro/fast"
+	mp "github.com/cosmos72/gomacro/go/parser"
 	"github.com/cosmos72/gomacro/xreflect"
 
 	// compile and link files generated in imports/
@@ -93,6 +95,12 @@ type kernelInfo struct {
 // shutdownReply encodes a boolean indication of shutdown/restart.
 type shutdownReply struct {
 	Restart bool `json:"restart"`
+}
+
+// isCompleteReply holds information about the statement is complete or not, for is_complete_reply messages.
+type isCompleteReply struct {
+	Status string `json:"status"`
+	Indent string `json:"indent"`
 }
 
 const (
@@ -326,6 +334,10 @@ func (kernel *Kernel) handleShellMsg(receipt msgReceipt) {
 		if err := sendKernelInfo(receipt); err != nil {
 			log.Fatal(err)
 		}
+	case "is_complete_request":
+		if err := kernel.handleIsCompleteRequest(receipt); err != nil {
+			log.Fatal(err)
+		}
 	case "complete_request":
 		if err := handleCompleteRequest(ir, receipt); err != nil {
 			log.Fatal(err)
@@ -358,6 +370,55 @@ func sendKernelInfo(receipt msgReceipt) error {
 				{Text: "Go", URL: "https://golang.org/"},
 				{Text: "gophernotes", URL: "https://github.com/gopherdata/gophernotes"},
 			},
+		},
+	)
+}
+
+// checkComplete checks whether the `code` is complete or not.
+func checkComplete(code string, ir *interp.Interp) (status, indent string) {
+	status, indent = "unknown", ""
+
+	if len(code) == 0 {
+		return status, indent
+	}
+	readline := base.MakeBufReadline(bufio.NewReader(strings.NewReader(code)))
+	for {
+		_, _, err := base.ReadMultiline(readline, base.ReadOptions(0), "")
+		if err == io.EOF {
+			return "complete", indent
+		} else if err == io.ErrUnexpectedEOF {
+			return "incomplete", indent
+		} else if err != nil {
+			return "invalid", indent
+		}
+	}
+
+	var parser mp.Parser
+	g := ir.Comp
+	parser.Configure(g.ParserMode, g.MacroChar)
+	parser.Init(g.Fileset, g.Filepath, g.Line, []byte(code))
+
+	_, err := parser.Parse()
+	if err != nil {
+		status = "invalid"
+	} else {
+		status = "complete"
+	}
+	return status, indent
+}
+
+// handleIsCompleteRequest sends a is_complete_reply message.
+func (kernel *Kernel) handleIsCompleteRequest(receipt msgReceipt) error {
+
+	// Extract the data from the request.
+	reqcontent := receipt.Msg.Content.(map[string]interface{})
+	code := reqcontent["code"].(string)
+	status, indent := checkComplete(code, kernel.ir)
+
+	return receipt.Reply("is_complete_reply",
+		isCompleteReply{
+			Status: status,
+			Indent: indent,
 		},
 	)
 }
@@ -403,30 +464,32 @@ func (kernel *Kernel) handleExecuteRequest(receipt msgReceipt) error {
 	var writersWG sync.WaitGroup
 	writersWG.Add(2)
 
+	jupyterStdOut := JupyterStreamWriter{StreamStdout, &receipt}
+	jupyterStdErr := JupyterStreamWriter{StreamStderr, &receipt}
+	outerr := OutErr{&jupyterStdOut, &jupyterStdErr}
+
 	// Forward all data written to stdout/stderr to the front-end.
 	go func() {
 		defer writersWG.Done()
-		jupyterStdOut := JupyterStreamWriter{StreamStdout, &receipt}
 		io.Copy(&jupyterStdOut, rOut)
 	}()
 
 	go func() {
 		defer writersWG.Done()
-		jupyterStdErr := JupyterStreamWriter{StreamStderr, &receipt}
 		io.Copy(&jupyterStdErr, rErr)
 	}()
 
 	// inject the actual "Display" closure that displays multimedia data in Jupyter
 	ir := kernel.ir
 	displayPlace := ir.ValueOf("Display")
-	displayPlace.Set(reflect.ValueOf(receipt.PublishDisplayData))
+	displayPlace.Set(xreflect.ValueOf(receipt.PublishDisplayData))
 	defer func() {
 		// remove the closure before returning
-		displayPlace.Set(reflect.ValueOf(stubDisplay))
+		displayPlace.Set(xreflect.ValueOf(stubDisplay))
 	}()
 
 	// eval
-	vals, types, executionErr := doEval(ir, code)
+	vals, types, executionErr := doEval(ir, outerr, code)
 
 	// Close and restore the streams.
 	wOut.Close()
@@ -468,7 +531,7 @@ func (kernel *Kernel) handleExecuteRequest(receipt msgReceipt) error {
 
 // doEval evaluates the code in the interpreter. This function captures an uncaught panic
 // as well as the values of the last statement/expression.
-func doEval(ir *interp.Interp, code string) (val []interface{}, typ []xreflect.Type, err error) {
+func doEval(ir *interp.Interp, outerr OutErr, code string) (val []interface{}, typ []xreflect.Type, err error) {
 
 	// Capture a panic from the evaluation if one occurs and store it in the `err` return parameter.
 	defer func() {
@@ -480,7 +543,7 @@ func doEval(ir *interp.Interp, code string) (val []interface{}, typ []xreflect.T
 		}
 	}()
 
-	code = evalSpecialCommands(ir, code)
+	code = evalSpecialCommands(ir, outerr, code)
 
 	// Prepare and perform the multiline evaluation.
 	compiler := ir.Comp
@@ -531,7 +594,7 @@ func doEval(ir *interp.Interp, code string) (val []interface{}, typ []xreflect.T
 		nonNilCount := 0
 		values := make([]interface{}, len(results))
 		for i, result := range results {
-			val := basereflect.Interface(result)
+			val := basereflect.ValueInterface(result)
 			if val != nil {
 				nonNilCount++
 			}
@@ -626,21 +689,44 @@ func startHeartbeat(hbSocket Socket, wg *sync.WaitGroup) (shutdown chan struct{}
 }
 
 // find and execute special commands in code, remove them from returned string
-func evalSpecialCommands(ir *interp.Interp, code string) string {
+func evalSpecialCommands(ir *interp.Interp, outerr OutErr, code string) string {
 	lines := strings.Split(code, "\n")
+	stop := false
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
-		if len(line) != 0 && line[0] == '%' {
-			evalSpecialCommand(ir, line)
-			lines[i] = ""
+		if len(line) != 0 {
+			switch line[0] {
+			case '%':
+				evalSpecialCommand(ir, outerr, line)
+				lines[i] = ""
+			case '$':
+				evalShellCommand(ir, outerr, line)
+				lines[i] = ""
+			default:
+				// if a line is NOT a special command,
+				// stop processing special commands
+				stop = true
+			}
+		}
+		if stop {
+			break
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-// execute special command
-func evalSpecialCommand(ir *interp.Interp, line string) {
-	const help string = "available special commands:\n  %go111module {on|off}\n  %help"
+// execute special command. line must start with '%'
+func evalSpecialCommand(ir *interp.Interp, outerr OutErr, line string) {
+	const help string = `
+available special commands (%):
+%cd [path]
+%go111module {on|off}
+%help
+
+execute shell commands ($): $command [args...]
+example:
+$ls -l
+`
 
 	args := strings.SplitN(line, " ", 2)
 	cmd := args[0]
@@ -649,7 +735,18 @@ func evalSpecialCommand(ir *interp.Interp, line string) {
 		arg = args[1]
 	}
 	switch cmd {
-
+	case "%cd":
+		if arg == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				panic(fmt.Errorf("error getting user home directory: %v", err))
+			}
+			arg = home
+		}
+		err := os.Chdir(arg)
+		if err != nil {
+			panic(fmt.Errorf("error setting current directory to %q: %v", arg, err))
+		}
 	case "%go111module":
 		if arg == "on" {
 			ir.Comp.CompGlobals.Options |= base.OptModuleImport
@@ -659,8 +756,53 @@ func evalSpecialCommand(ir *interp.Interp, line string) {
 			panic(fmt.Errorf("special command %s: expecting a single argument 'on' or 'off', found: %q", cmd, arg))
 		}
 	case "%help":
-		panic(help)
+		fmt.Fprint(outerr.out, help)
 	default:
 		panic(fmt.Errorf("unknown special command: %q\n%s", line, help))
 	}
+}
+
+// execute shell command. line must start with '$'
+func evalShellCommand(ir *interp.Interp, outerr OutErr, line string) {
+	args := strings.Fields(line[1:])
+	if len(args) <= 0 {
+		return
+	}
+
+	var writersWG sync.WaitGroup
+	writersWG.Add(2)
+
+	cmd := exec.Command(args[0], args[1:]...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		panic(fmt.Errorf("Command.StdoutPipe() failed: %v", err))
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		panic(fmt.Errorf("Command.StderrPipe() failed: %v", err))
+	}
+
+	go func() {
+		defer writersWG.Done()
+		io.Copy(outerr.out, stdout)
+	}()
+
+	go func() {
+		defer writersWG.Done()
+		io.Copy(outerr.err, stderr)
+	}()
+
+	err = cmd.Start()
+	if err != nil {
+		panic(fmt.Errorf("error starting command '%s': %v", line[1:], err))
+	}
+
+	err = cmd.Wait()
+	if err != nil {
+		panic(fmt.Errorf("error waiting for command '%s': %v", line[1:], err))
+	}
+
+	writersWG.Wait()
 }
